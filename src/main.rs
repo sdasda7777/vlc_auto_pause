@@ -4,6 +4,48 @@ use windows::Media::Control::*;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::header::AUTHORIZATION;
 
+trait SessionManager {
+    fn is_any_other_playing(&self) -> bool;
+}
+
+struct WindowsSessionManager {
+    manager: GlobalSystemMediaTransportControlsSessionManager,
+}
+
+impl WindowsSessionManager {
+    fn new() -> Self {
+        // Get media session manager
+        let manager = match GlobalSystemMediaTransportControlsSessionManager::RequestAsync() {
+            Err(err) => panic!("`manager.GetSessions()` got {:?}", err),
+            Ok(manager) => match manager.get() {
+                Err(err) => panic!("`manager.get()` got {:?}", err),
+                Ok(manager) => manager,
+            }
+        };
+        Self { manager }
+    }
+}
+
+impl SessionManager for WindowsSessionManager {
+    fn is_any_other_playing(&self) -> bool {
+        if let Ok(sessions) = self.manager.GetSessions() {
+            for e in sessions {
+                if let Ok(info) = e.GetPlaybackInfo() {
+                    if let Ok(status) = info.PlaybackStatus() {
+                        if status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing
+                            || status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Changing {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+}
+
+
+
 /// Find named argument, parse it to T
 fn find_parse<T: std::str::FromStr>(
     args: &[String],
@@ -14,30 +56,37 @@ fn find_parse<T: std::str::FromStr>(
         .and_then(|e| e[1].parse::<T>().ok())
 }
 
-// Main function
+
+// Main function for Windows
+#[cfg(target_os = "windows")]
 fn main() {
+    do_stuff(&env::args().collect::<Vec<_>>(), WindowsSessionManager::new());
+}
+
+// Main function for Linux
+#[cfg(target_os = "linux")]
+fn main() {
+    do_stuff(&env::args().collect::<Vec<_>>(), MPRISSessionManager::new());
+}
+
+fn do_stuff(args: &[String], manager: impl SessionManager) {
     
-    let args: Vec<_> = env::args().collect();
+    let check_interval = find_parse(args, "--check-interval").unwrap_or(1000);
     
-    let status_url = "http://localhost:8080/requests/status.json";
-    let command_url = "http://localhost:8080/requests/status.xml?command=pl_pause";
+    // URLs
+    let base_url = find_parse(args, "--vlc-base-url").unwrap_or("http://localhost:8080".to_string());
+    let status_url = format!("{}/requests/status.json", base_url);
+    let command_url = format!("{}/requests/status.xml?command=pl_pause", base_url);
+    
     // username is (afaik) always blank, password is your vlc http server password
     let username = "";
-    let password: String = find_parse(&args, "--vlc-http-password")
-              .expect("Error: Expected vlc password as `--vlc-http-password` argument");
+    let password: String = find_parse(args, "--vlc-http-password")
+              .expect("Error: Mandatory argument `--vlc-http-password` not found");
     
     let authstring = "Basic ".to_owned()
                         + &STANDARD.encode(format!("{}:{}", username, password));
     
     let client = reqwest::blocking::Client::new();
-    macro_rules! vlc_play_pause { () => {
-        let req = client.get(command_url)
-            .header(AUTHORIZATION, authstring.clone());
-        match req.send() {
-            Err(err) => println!("req got {:?}", err),
-            Ok(_resp) => (), // println!("req got {:?}", resp),
-        }
-    }}
     
     // Get current VLC state (very jank)
     let mut vlc_currently_paused = !client.get(status_url)
@@ -46,46 +95,18 @@ fn main() {
                                         .and_then(|e| e.text().map_err(|_|())?.find("\"state\":\"playing\"").ok_or(()))
                                         .is_ok();
     
-    // Get media session manager
-    let manager = match GlobalSystemMediaTransportControlsSessionManager::RequestAsync() {
-        Err(err) => panic!("`manager.GetSessions()` got {:?}", err),
-        Ok(manager) => match manager.get() {
-            Err(err) => panic!("`manager.get()` got {:?}", err),
-            Ok(manager) => manager,
-        }
-    };
-    
-    'outer: loop {
-        std::thread::sleep(std::time::Duration::from_millis(1000));
-        match manager.GetSessions() {
-            Err(err) => println!("`manager.GetSessions()` is {:?}", err),
-            Ok(sessions) => {
-                
-                for e in sessions {
-                    match e.GetPlaybackInfo() {
-                        Err(err) => println!("`GetPlaybackInfo` got {:?}", err),
-                        Ok(info) => match info.PlaybackStatus() {
-                            Err(err) => println!("`PlaybackStatus` got {:?}", err),
-                            Ok(status) => {
-                                if status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing
-                                    || status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Changing {
-                                    if !vlc_currently_paused {
-                                        vlc_play_pause!(); // pause VLC
-                                        vlc_currently_paused = true;
-                                    }
-                                    continue 'outer;
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                // No sessions can be currently playing
-                if vlc_currently_paused {
-                    vlc_play_pause!(); // unpause VLC
-                    vlc_currently_paused = false;
-                }
+    // Main loop
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(check_interval));
+        if manager.is_any_other_playing() != vlc_currently_paused {
+            let req = client.get(command_url.clone())
+                .header(AUTHORIZATION, authstring.clone());
+            match req.send() { // pause/unpause VLC
+                Err(err) => println!("req got {:?}", err),
+                Ok(_resp) => (), // println!("req got {:?}", resp),
             }
+            
+            vlc_currently_paused = !vlc_currently_paused;
         }
     }
 }
