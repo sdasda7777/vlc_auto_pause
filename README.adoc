@@ -1,0 +1,18 @@
+= vlc_auto_pause
+
+Automatically pause VLC when another media session is playing and unpause when all stop (currently Windows only).
+
+== Usage
+
+I use it with https://github.com/GreenDiscord/vlc-rpc[vlc-rpc], where I've modified `start.bat` to lauch `vlc_auto_pause.exe` before launching VLC.
+
+[,shell]
+----
+
+)
+
+START /B vlc_auto_pause.exe --vlc-http-password passwordgoeshere
+
+if exist node.exe (
+
+----
