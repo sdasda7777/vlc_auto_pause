@@ -3,6 +3,7 @@ use std::env;
 use windows::Media::Control::*;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::header::AUTHORIZATION;
+use serde::Deserialize;
 
 trait SessionManager {
     fn is_any_other_playing(&self) -> bool;
@@ -75,7 +76,6 @@ fn do_stuff(args: &[String], manager: impl SessionManager) {
     
     // URLs
     let base_url = find_parse(args, "--vlc-base-url").unwrap_or("http://localhost:8080".to_string());
-    let status_url = format!("{}/requests/status.json", base_url);
     let command_url = format!("{}/requests/status.xml?command=pl_pause", base_url);
     
     // username is (afaik) always blank, password is your vlc http server password
@@ -83,30 +83,64 @@ fn do_stuff(args: &[String], manager: impl SessionManager) {
     let password: String = find_parse(args, "--vlc-http-password")
               .expect("Error: Mandatory argument `--vlc-http-password` not found");
     
+    // create Basic authstring
     let authstring = "Basic ".to_owned()
                         + &STANDARD.encode(format!("{}:{}", username, password));
     
-    let client = reqwest::blocking::Client::new();
-    
-    // Get current VLC state (very jank)
-    let mut vlc_currently_paused = !client.get(status_url)
-                                        .header(AUTHORIZATION, authstring.clone()).send()
-                                        .map_err(|_|())
-                                        .and_then(|e| e.text().map_err(|_|())?.find("\"state\":\"playing\"").ok_or(()))
-                                        .is_ok();
+    // Get current VLC state as a baseline
+    let mut vlc_should_be_paused = !vlc_is_playing(&base_url, &authstring);
     
     // Main loop
     loop {
         std::thread::sleep(std::time::Duration::from_millis(check_interval));
-        if manager.is_any_other_playing() != vlc_currently_paused {
-            let req = client.get(command_url.clone())
-                .header(AUTHORIZATION, authstring.clone());
+        
+        let other_is_playing = manager.is_any_other_playing();
+        if other_is_playing != vlc_should_be_paused
+           && other_is_playing != !vlc_is_playing(&base_url, &authstring) {
+            let req = reqwest::blocking::Client::new()
+                        .get(command_url.clone())
+                        .header(AUTHORIZATION, authstring.clone());
             match req.send() { // pause/unpause VLC
                 Err(err) => println!("req got {:?}", err),
                 Ok(_resp) => (), // println!("req got {:?}", resp),
             }
             
-            vlc_currently_paused = !vlc_currently_paused;
+            vlc_should_be_paused = !vlc_should_be_paused;
         }
     }
+}
+
+#[derive(Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+enum VLCPlayState {
+    Playing,
+    Paused,
+    Stopped,
+}
+
+#[derive(Deserialize)]
+struct VLCStatus {
+    state: VLCPlayState,
+}
+
+fn vlc_is_playing(base_url: &str, authstring: &str) -> bool {
+    reqwest::blocking::Client::new().get(format!("{}/requests/status.json", base_url))
+        .header(AUTHORIZATION, authstring).send().map_err(|_|())
+        .and_then(|e| 
+            match e.json::<VLCStatus>() {
+                Ok(s) if s.state == VLCPlayState::Playing => {
+                    // println!("VLCPlayState::Playing");
+                    Ok(())
+                },
+                Ok(_) => {
+                    // println!("VLCPlayState::other");
+                    Err(())
+                },
+                Err(_err) => {
+                    // println!("{}", err);
+                    Err(())
+                }
+            }
+        )
+        .is_ok()
 }
